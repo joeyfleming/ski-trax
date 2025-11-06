@@ -1,0 +1,362 @@
+/* Tracker_Integrated.ino
+   - BMP280 on I2C (GPIO44 SDA, GPIO45 SCL)
+   - ILI9341 on SPI (CS=7, RST=6, DC=5, MOSI=4, SCK=17)
+   - HMC5883L magnetometer on I2C (same bus)
+   - GPS on Serial1 (RX/TX pins below)
+   - LoRa (SX127x) using LoRa.h (set pins below)
+   - Baseline sea-level pressure: 1023.5 hPa (user request)
+   - Altitude displayed in feet
+*/
+
+#include <Wire.h>
+#include <SPI.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BMP280.h>
+#include <Adafruit_HMC5883_U.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <TinyGPS++.h>
+#include <LoRa.h>
+
+/*** ===== USER-CONFIG (change these to match your wiring) ===== ***/
+
+// ILI9341 pins (your existing wiring)
+#define TFT_CS   7
+#define TFT_RST  6
+#define TFT_DC   5
+#define TFT_MOSI 4
+#define TFT_SCK  17
+#define TFT_MISO -1
+
+// I2C pins for BMP280 + HMC5883
+#define I2C_SDA 44
+#define I2C_SCL 45
+
+// GPS (Serial1) pins on ESP32-S3: RX1 is where GPS TX connects (change if needed)
+#define GPS_RX_PIN 16   // GPS TX -> this pin (receiving pin for Serial1)
+#define GPS_TX_PIN 17   // GPS RX -> this pin (if you need to send to GPS); not used here
+
+// LoRa pins (example placeholders — change to match your board)
+// For many SX127x modules on ESP32-S3 the following are common; adjust if needed:
+#define LORA_SS    18
+#define LORA_RST   14
+#define LORA_DIO0  26
+#define LORA_SCK   5   // SPI SCK for LoRa (if separate SPI bus)
+#define LORA_MISO  19
+#define LORA_MOSI  27
+
+// LoRa frequency (set to your regional frequency)
+#define LORA_FREQ 915E6   // 915 MHz (USA). Use 868E6 for EU.
+
+// Baseline sea-level pressure requested by user (in hPa / mb)
+const float SEA_LEVEL_HPA = 1023.5f;
+
+/*** ===== END USER-CONFIG ===== ***/
+
+Adafruit_BMP280 bmp;               // BMP280 (I2C)
+Adafruit_HMC5883_Unified mag = Adafruit_HMC5883_Unified(12345);
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+
+TinyGPSPlus gps;
+
+// State for partner location (last received)
+volatile bool partnerAvailable = false;
+double partnerLat = 0.0;
+double partnerLon = 0.0;
+float partnerAltFt = 0.0;   // partner altitude (feet)
+unsigned long lastSend = 0;
+unsigned long sendInterval = 5000; // ms
+
+// Our last known position and heading
+double myLat = 0.0, myLon = 0.0;
+float myAltMeters = 0.0;
+float myAltFeet = 0.0;
+float myHeading = 0.0; // degrees
+
+// Helper constants
+const float METER_TO_FEET = 3.28084f;
+
+/*** ===== Utility functions ===== ***/
+
+// Compute bearing from (lat1, lon1) to (lat2, lon2) in degrees (0..360)
+double bearingTo(double lat1, double lon1, double lat2, double lon2) {
+  // convert to radians
+  double phi1 = radians(lat1);
+  double phi2 = radians(lat2);
+  double dLon = radians(lon2 - lon1);
+  double y = sin(dLon) * cos(phi2);
+  double x = cos(phi1)*sin(phi2) - sin(phi1)*cos(phi2)*cos(dLon);
+  double brng = atan2(y, x);
+  brng = degrees(brng);
+  brng = fmod((brng + 360.0), 360.0);
+  return brng;
+}
+
+// Haversine distance in meters
+double distanceMeters(double lat1, double lon1, double lat2, double lon2) {
+  const double R = 6371000.0; // Earth radius in meters
+  double dLat = radians(lat2 - lat1);
+  double dLon = radians(lon2 - lon1);
+  double a = sin(dLat/2)*sin(dLat/2) + cos(radians(lat1))*cos(radians(lat2))*sin(dLon/2)*sin(dLon/2);
+  double c = 2 * atan2(sqrt(a), sqrt(1-a));
+  return R * c;
+}
+
+// Draw an arrow pointing angle degrees (0 = north/up, clockwise) at center of screen
+void drawArrow(float angleDeg) {
+  // convert heading to screen coordinates: 0 deg -> up, angle clockwise
+  // our display orientation: rotation(1) used earlier; we test visually and adjust if needed
+  int cx = tft.width()/2;
+  int cy = tft.height()/2 + 10;
+  int len = 50;
+
+  // clear arrow area
+  tft.fillRect(cx - 70, cy - 70, 140, 140, ILI9341_BLACK);
+
+  // compute endpoint
+  float angRad = radians(angleDeg - 0.0); // no offset
+  int ex = cx + (int)(len * sin(angRad)); // sin for x because 0 deg = north
+  int ey = cy - (int)(len * cos(angRad)); // cos for y
+
+  tft.drawLine(cx, cy, ex, ey, ILI9341_CYAN);
+  // draw arrow head
+  float backAng = angRad + PI;
+  int hx1 = ex + (int)(10 * sin(backAng + 0.4));
+  int hy1 = ey - (int)(10 * cos(backAng + 0.4));
+  int hx2 = ex + (int)(10 * sin(backAng - 0.4));
+  int hy2 = ey - (int)(10 * cos(backAng - 0.4));
+  tft.fillTriangle(ex, ey, hx1, hy1, hx2, hy2, ILI9341_CYAN);
+}
+
+/*** ===== Setup & loop ===== ***/
+
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+  Serial.println(F("Tracker Integrated Startup"));
+
+  // Initialize display
+  SPI.begin(TFT_SCK, TFT_MISO, TFT_MOSI, TFT_CS); // reuse earlier pins
+  tft.begin();
+  tft.setRotation(1);
+  tft.fillScreen(ILI9341_BLACK);
+
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setCursor(4, 4);
+  tft.print("Tracker Booting...");
+
+  // Init I2C on requested pins
+  Wire.begin(I2C_SDA, I2C_SCL);
+  delay(10);
+
+  // BMP280
+  if (!bmp.begin(0x76) && !bmp.begin(0x77)) {
+    Serial.println(F("BMP280 not found!"));
+    tft.setTextColor(ILI9341_RED);
+    tft.setCursor(4, 28);
+    tft.print("BMP280: NOT FOUND");
+  } else {
+    Serial.println(F("BMP280 found"));
+    tft.setTextColor(ILI9341_GREEN);
+    tft.setCursor(4, 28);
+    tft.print("BMP280: FOUND");
+    bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                    Adafruit_BMP280::SAMPLING_X2,
+                    Adafruit_BMP280::SAMPLING_X16,
+                    Adafruit_BMP280::FILTER_X16,
+                    Adafruit_BMP280::STANDBY_MS_500);
+  }
+
+  // Magnetometer HMC5883
+  if (!mag.begin()) {
+    Serial.println(F("Mag not found"));
+    tft.setTextColor(ILI9341_YELLOW);
+    tft.setCursor(4, 52);
+    tft.print("HMC5883: NOT FOUND");
+  } else {
+    Serial.println(F("Mag found"));
+    tft.setTextColor(ILI9341_GREEN);
+    tft.setCursor(4, 52);
+    tft.print("HMC5883: FOUND");
+  }
+
+  // Initialize GPS on Serial1; GPS TX -> GPS_RX_PIN
+  Serial1.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN); // RX, TX pins for Serial1
+  Serial.println(F("Serial1 for GPS started"));
+
+  // Initialize LoRa (using default SPI unless you configure differently)
+  // If your LoRa module uses separate SPI pins, call SPI.begin with those pins before LoRa.begin
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI);
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+  if (!LoRa.begin(LORA_FREQ)) {
+    Serial.println(F("LoRa init failed"));
+    tft.setTextColor(ILI9341_RED);
+    tft.setCursor(4, 76);
+    tft.print("LoRa: ERROR");
+  } else {
+    Serial.println(F("LoRa initialized"));
+    tft.setTextColor(ILI9341_GREEN);
+    tft.setCursor(4, 76);
+    tft.print("LoRa: OK");
+  }
+
+  // Draw static labels
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setTextSize(1);
+  tft.setCursor(4, 100); tft.print("Temp C:");
+  tft.setCursor(4, 116); tft.print("Pressure (hPa):");
+  tft.setCursor(4, 132); tft.print("Alt (ft):");
+  tft.setCursor(4, 148); tft.print("GPS:");
+  tft.setCursor(120, 148); tft.print("HDG:");
+  tft.setCursor(4, 164); tft.print("Partner:");
+}
+
+void handleLoRaReceive() {
+  int packetSize = LoRa.parsePacket();
+  if (packetSize) {
+    String incoming = "";
+    while (LoRa.available()) {
+      incoming += (char)LoRa.read();
+    }
+    Serial.print("LoRa RX: "); Serial.println(incoming);
+
+    // Expecting a simple CSV: lat,lon,alt_ft,heading
+    // e.g. "40.1234,-105.1234,8200,45.2"
+    double lat=0, lon=0; float alt_ft=0, hdg=0;
+    int parsed = sscanf(incoming.c_str(), "%lf,%lf,%f,%f", &lat, &lon, &alt_ft, &hdg);
+    if (parsed >= 4) {
+      partnerLat = lat;
+      partnerLon = lon;
+      partnerAltFt = alt_ft;
+      partnerAvailable = true;
+    } else {
+      Serial.println("Unrecognized packet");
+    }
+  }
+}
+
+void sendMyPacket() {
+  // Build simple CSV payload
+  char buf[128];
+  // Compose: lat,lon,alt_ft,heading
+  // We use 6 decimals for lat/lon for accuracy; alt in feet; heading in degrees
+  snprintf(buf, sizeof(buf), "%.6f,%.6f,%.1f,%.1f", myLat, myLon, myAltFeet, myHeading);
+  LoRa.beginPacket();
+  LoRa.print(buf);
+  LoRa.endPacket();
+  Serial.print("LoRa TX: "); Serial.println(buf);
+}
+
+void loop() {
+  // Read GPS (pump serial into TinyGPS++)
+  while (Serial1.available()) {
+    char c = Serial1.read();
+    gps.encode(c);
+  }
+  // If gps got a fix, update myLat/myLon
+  if (gps.location.isUpdated()) {
+    myLat = gps.location.lat();
+    myLon = gps.location.lng();
+  }
+  if (gps.altitude.isUpdated()) {
+    myAltMeters = gps.altitude.meters();
+    myAltFeet = myAltMeters * METER_TO_FEET;
+  }
+
+  // Read magnetometer for heading (simple yaw from HMC5883)
+  sensors_event_t event;
+  if (mag.getEvent(&event)) {
+    // heading (degrees) from magnetic vector
+    float heading = atan2(event.magnetic.y, event.magnetic.x);
+    float headingDegrees = degrees(heading);
+    if (headingDegrees < 0) headingDegrees += 360;
+    myHeading = headingDegrees;
+  }
+
+  // Read BMP280 for pressure/temp and compute altitude using provided SEA_LEVEL_HPA (in hPa)
+  float temperature = NAN;
+  float pressure_hPa = NAN;
+  float alt_m = NAN;
+  if (bmp.begin(0x76) || bmp.begin(0x77)) {
+    // only read, don't re-init each loop in production — this is safe here for robustness
+    temperature = bmp.readTemperature();
+    float pressurePa = bmp.readPressure(); // Pa
+    pressure_hPa = pressurePa / 100.0f; // convert Pa -> hPa
+    // Adafruit readAltitude expects sea-level pressure in hPa
+    alt_m = bmp.readAltitude(SEA_LEVEL_HPA);
+    myAltMeters = alt_m;
+    myAltFeet = alt_m * METER_TO_FEET;
+  }
+
+  // Attempt to receive LoRa packets
+  handleLoRaReceive();
+
+  // Periodically send our packet
+  if (millis() - lastSend >= sendInterval) {
+    // only send if we have a gps fix
+    if (gps.location.isValid()) {
+      sendMyPacket();
+    }
+    lastSend = millis();
+  }
+
+  // Update display values
+  // Temperature
+  tft.fillRect(80, 100, 120, 12, ILI9341_BLACK);
+  tft.setTextSize(1);
+  tft.setCursor(80, 100);
+  if (!isnan(temperature)) tft.print(temperature, 2); else tft.print("---");
+
+  // Pressure
+  tft.fillRect(140, 116, 80, 12, ILI9341_BLACK);
+  tft.setCursor(140, 116);
+  if (!isnan(pressure_hPa)) tft.print(pressure_hPa, 2); else tft.print("---");
+
+  // Altitude (ft)
+  tft.fillRect(72, 132, 120, 12, ILI9341_BLACK);
+  tft.setCursor(72, 132);
+  if (!isnan(myAltFeet)) tft.print(myAltFeet, 1); else tft.print("---");
+
+  // GPS lat/lon status
+  tft.fillRect(36, 148, 80, 12, ILI9341_BLACK);
+  tft.setCursor(36, 148);
+  if (gps.location.isValid()) {
+    tft.print("OK");
+  } else {
+    tft.print("NO FIX");
+  }
+
+  // Heading
+  tft.fillRect(150, 148, 60, 12, ILI9341_BLACK);
+  tft.setCursor(150, 148);
+  tft.print(myHeading, 0);
+
+  // Partner info and arrow
+  tft.setTextSize(1);
+  tft.setCursor(60, 164);
+  if (partnerAvailable) {
+    double dist = distanceMeters(myLat, myLon, partnerLat, partnerLon);
+    double brg = bearingTo(myLat, myLon, partnerLat, partnerLon);
+    float relAlt = partnerAltFt - myAltFeet;
+    // text
+    tft.fillRect(60, 164, 160, 12, ILI9341_BLACK);
+    tft.setCursor(60, 164);
+    tft.print((int)dist); tft.print("m ");
+    tft.print((int)brg); tft.print((char)176); tft.print(" ");
+    if (relAlt >= 0) tft.print("+"); tft.print((int)relAlt); tft.print("ft");
+    // draw arrow rotated relative to device heading:
+    float arrowAngle = brg - myHeading; // direction to partner relative to where user faces
+    // normalize 0..360
+    arrowAngle = fmod((arrowAngle + 360.0f), 360.0f);
+    drawArrow(arrowAngle);
+  } else {
+    tft.fillRect(60, 164, 160, 12, ILI9341_BLACK);
+    tft.setCursor(60, 164);
+    tft.print("No partner data");
+    // clear arrow area
+    tft.fillRect(tft.width()/2 - 70, tft.height()/2 - 70, 140, 140, ILI9341_BLACK);
+  }
+
+  delay(200); // small pause to allow display readability
+}
