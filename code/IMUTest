@@ -1,0 +1,182 @@
+/* Pinger + Display (sends random number, shows local and received + RSSI)
+   Flash this to the display module.
+*/
+
+#include <SPI.h>
+#include <RadioLib.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+
+// Display pins (your working pins)
+#define TFT_CS      7
+#define TFT_DC      5
+#define TFT_RST     6
+#define TFT_MOSI    4
+#define TFT_SCK     17
+
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCK, TFT_RST);
+
+// LoRa pins
+#define LORA_SCK   9
+#define LORA_MISO  11
+#define LORA_MOSI  10
+#define LORA_NSS   8
+#define LORA_RST   12
+#define LORA_BUSY  13
+#define LORA_DIO1  14
+
+Module loraMod = Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY);
+SX1262 lora = SX1262(&loraMod);
+
+// RF params (must match responder)
+const float LORA_FREQ_MHZ = 915.0f;
+const float LORA_BW_KHZ   = 125.0f;
+const uint8_t LORA_SF     = 7;
+const uint8_t LORA_CR     = 5;
+const uint8_t LORA_SYNC   = 0x34;
+int8_t TX_POWER_DBM = 14;
+
+const uint32_t PACKET_INTERVAL_MS = 10000UL;
+const uint32_t RX_LISTEN_MS = 3000UL;
+
+void showRadioError(int16_t e){ Serial.print("RadioLib error: "); Serial.println(e); }
+
+void drawTopBoxLocal(int localNum) {
+  tft.fillRect(0, 0, 240, 64, ILI9341_BLACK);
+  tft.drawRect(4, 4, 240 - 8, 64 - 8, ILI9341_WHITE);
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setCursor(20, 8);
+  tft.print("Local number");
+  tft.setTextSize(3);
+  tft.setTextColor(ILI9341_CYAN);
+  tft.setCursor(20, 36);
+  if(localNum >= 0) tft.print(localNum);
+  else tft.print("---");
+}
+
+void drawReceiveBoxShow(const String &recvText, int16_t rssi) {
+  tft.fillRect(0, 72, 240, 240 - 72, ILI9341_BLACK);
+  tft.drawRect(6, 74, 240 - 12, 240 - 80, ILI9341_WHITE);
+  tft.setTextSize(1);
+  tft.setTextColor(ILI9341_YELLOW);
+  tft.setCursor(12, 78);
+  tft.print("Received:");
+  tft.setTextSize(1);
+  tft.setTextColor(ILI9341_YELLOW);
+  tft.setCursor(140, 78);
+  tft.print("RSSI:");
+  tft.print(rssi);
+
+  tft.setTextSize(4);
+  tft.setTextColor(ILI9341_GREEN);
+  tft.setCursor(40, 110);
+  tft.print(recvText);
+}
+
+void drawReceiveBoxNoRX() {
+  tft.fillRect(0, 72, 240, 240 - 72, ILI9341_BLACK);
+  tft.drawRect(6, 74, 240 - 12, 240 - 80, ILI9341_WHITE);
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_RED);
+  tft.setCursor(40, 120);
+  tft.print("No RX");
+}
+
+String makePacketForNumber(int n){
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%04d", n);
+  return String(buf);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  // small random startup delay to desync both nodes
+  randomSeed(analogRead(A0));
+  delay(random(0,3000));
+
+  // Init display
+  tft.begin();
+  tft.setRotation(1);
+  tft.fillScreen(ILI9341_BLACK);
+  drawTopBoxLocal(-1);
+  drawReceiveBoxNoRX();
+
+  // Init LoRa SPI
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI);
+
+  Serial.print("Initializing LoRa @ ");
+  Serial.print(LORA_FREQ_MHZ);
+  Serial.println(" MHz...");
+  int16_t st = lora.begin(LORA_FREQ_MHZ, LORA_BW_KHZ, LORA_SF, LORA_CR, LORA_SYNC, TX_POWER_DBM);
+  if (st != RADIOLIB_ERR_NONE) {
+    Serial.print("LoRa init failed: "); Serial.println(st);
+    showRadioError(st);
+    tft.fillScreen(ILI9341_RED);
+    tft.setTextSize(2);
+    tft.setTextColor(ILI9341_WHITE);
+    tft.setCursor(20, 120);
+    tft.print("LoRa Init Failed!");
+    while (true) delay(1000);
+  }
+  Serial.println("LoRa initialized.");
+}
+
+void loop() {
+  // randomized small backoff to reduce simultaneous transmissions
+  delay(random(20,200));
+
+  // generate and send local number
+  int localNum = random(0, 10000);
+  String payload = makePacketForNumber(localNum);
+  drawTopBoxLocal(localNum);
+
+  Serial.print("TX -> "); Serial.println(payload);
+  int16_t txErr = lora.transmit(payload);
+  if (txErr != RADIOLIB_ERR_NONE) {
+    Serial.print("Transmit failed: "); Serial.println(txErr);
+    showRadioError(txErr);
+    drawReceiveBoxNoRX();
+  } else {
+    Serial.println("Transmit OK");
+  }
+
+  // Listen for ACK for RX_LISTEN_MS
+  Serial.print("Listening for reply for "); Serial.print(RX_LISTEN_MS); Serial.println(" ms...");
+  String received;
+  int16_t rxErr = lora.receive(received, 512, RX_LISTEN_MS);
+
+  if (rxErr == RADIOLIB_ERR_NONE) {
+    Serial.print("RX <- "); Serial.println(received);
+    int16_t rssi = lora.getRSSI();
+    Serial.print("RSSI: "); Serial.println(rssi);
+
+    // If ACK: "ACK:<payload>", strip ACK: if present
+    String show = received;
+    if (received.startsWith("ACK:")) {
+      show = received.substring(4);
+    }
+    // sanitize digits only (or show raw)
+    String digits="";
+    for (int i=0;i<(int)show.length();++i) {
+      if (isDigit(show.charAt(i))) digits += show.charAt(i);
+    }
+    if (digits.length()==0) digits = show;
+
+    drawReceiveBoxShow(digits, rssi);
+  }
+  else if (rxErr == RADIOLIB_ERR_RX_TIMEOUT) {
+    Serial.println("RX: timeout (no reply)");
+    drawReceiveBoxNoRX();
+  }
+  else {
+    Serial.print("RX error: "); Serial.println(rxErr);
+    showRadioError(rxErr);
+    drawReceiveBoxNoRX();
+  }
+
+  // Wait until next cycle
+  delay(PACKET_INTERVAL_MS);
+}
